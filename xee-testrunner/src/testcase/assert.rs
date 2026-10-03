@@ -1011,12 +1011,12 @@ impl fmt::Display for Failure {
             }
             Failure::StringValue(a, failure) => {
                 writeln!(f, "string-value:")?;
-                write_text(f, "expected", &a.0)?;
                 match failure {
                     AssertStringValueFailure::WrongStringValue(actual) => {
-                        write_text(f, "actual", actual)?;
+                        write_comparison(f, &a.0, actual)?;
                     }
                     AssertStringValueFailure::WrongValue(_) => {
+                        write_text(f, "expected", &a.0)?;
                         writeln!(f, "  actual: {:?}", failure)?;
                     }
                 }
@@ -1029,8 +1029,11 @@ impl fmt::Display for Failure {
                         if let AssertXml::MatchFile(path) = a {
                             writeln!(f, "  expected file: {}", path.display())?;
                         }
-                        write_text(f, "expected", expected)?;
-                        write_text(f, "actual", actual)?;
+                        write_comparison(
+                            f,
+                            &normalize_xml_text(expected),
+                            &normalize_xml_text(actual),
+                        )?;
                     }
                     AssertXmlFailure::WrongValue(_) => {
                         writeln!(f, "  expected: {:?}", a)?;
@@ -1086,6 +1089,51 @@ fn write_text(f: &mut fmt::Formatter<'_>, label: &str, text: &str) -> fmt::Resul
     }
 }
 
+// Write how an expected text differs from the actual one. When both fit on a
+// line they are shown as they are; otherwise a unified diff, so a difference in
+// a long result is not left for the reader to find.
+fn write_comparison(f: &mut fmt::Formatter<'_>, expected: &str, actual: &str) -> fmt::Result {
+    if !expected.contains('\n') && !actual.contains('\n') {
+        write_text(f, "expected", expected)?;
+        return write_text(f, "actual", actual);
+    }
+    let diff = similar::TextDiff::from_lines(expected, actual)
+        .unified_diff()
+        .context_radius(3)
+        .to_string();
+    if diff.is_empty() {
+        // Identical text that still failed: the comparison saw a difference the
+        // text does not show, so a diff would print nothing. Show both sides.
+        write_text(f, "expected", expected)?;
+        return write_text(f, "actual", actual);
+    }
+    writeln!(f, "  diff (- expected, + actual):")?;
+    for line in diff.lines() {
+        writeln!(f, "    {}", line)?;
+    }
+    Ok(())
+}
+
+// The comparison parses both sides as XML, so differences it does not see must
+// not show in the diff either. A result is serialized without an XML
+// declaration, and XML parsing turns CRLF and a lone CR into LF (XML 1.0,
+// section 2.11); many expected files, a majority of the XSLT suite's .out files,
+// use CRLF, which would otherwise mark every line as changed.
+fn normalize_xml_text(text: &str) -> String {
+    strip_xml_declaration(text)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+}
+
+fn strip_xml_declaration(text: &str) -> &str {
+    if text.starts_with("<?xml") {
+        if let Some(end) = text.find("?>") {
+            return text[end + 2..].trim_start_matches(['\r', '\n']);
+        }
+    }
+    text
+}
+
 fn run_xpath(expr: &XPathExpr) -> error::Result<Sequence> {
     let queries = Queries::default();
     let q = queries.sequence(expr)?;
@@ -1124,18 +1172,91 @@ mod tests {
 
     use crate::{language::XPathLanguage, ns::XPATH_TEST_NS, paths::Mode};
 
-    #[test]
-    fn test_failure_xml_display_multiline() {
-        let failure = Failure::Xml(
-            AssertXml::new("<out>\n<a/>\n</out>".to_string()),
+    fn xml_failure(expected: &str, actual: &str) -> Failure {
+        Failure::Xml(
+            AssertXml::new(expected.to_string()),
             AssertXmlFailure::WrongXml {
-                expected: "<out>\n<a/>\n</out>".to_string(),
-                actual: "<out/>".to_string(),
+                expected: expected.to_string(),
+                actual: actual.to_string(),
             },
+        )
+    }
+
+    #[test]
+    fn test_failure_xml_display_multiline_is_a_diff() {
+        let failure = xml_failure("<out>\n<a/>\n</out>\n", "<out>\n<b/>\n</out>\n");
+        assert_eq!(
+            failure.to_string(),
+            "xml:\n  diff (- expected, + actual):\n    @@ -1,3 +1,3 @@\n     <out>\n    -<a/>\n    +<b/>\n     </out>\n"
+        );
+    }
+
+    #[test]
+    fn test_failure_diff_keeps_only_the_context_around_a_change() {
+        let expected: String = (1..=20).map(|n| format!("line{n:02}\n")).collect();
+        let actual = expected.replace("line10", "changed");
+        let shown = xml_failure(&expected, &actual).to_string();
+        assert!(shown.contains("-line10") && shown.contains("+changed"));
+        // Three lines either side, and no more.
+        assert!(shown.contains("line07") && shown.contains("line13"));
+        assert!(!shown.contains("line06") && !shown.contains("line14"));
+    }
+
+    #[test]
+    fn test_failure_diff_ignores_the_expected_xml_declaration() {
+        // The actual side is serialized without one, so it must not show as a change.
+        let failure = xml_failure(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><out>\n<a/>\n</out>\n",
+            "<out>\n<b/>\n</out>\n",
+        );
+        let shown = failure.to_string();
+        assert!(shown.contains("-<a/>") && shown.contains("+<b/>"));
+        assert!(!shown.contains("<?xml"));
+        assert!(!shown.contains("-<out>"));
+    }
+
+    #[test]
+    fn test_failure_xml_diff_treats_crlf_like_lf() {
+        // Only <b/> differs; the line endings are the parser's business.
+        let failure = xml_failure("<out>\r\n<a/>\r\n</out>\r\n", "<out>\n<b/>\n</out>\n");
+        assert_eq!(
+            failure.to_string(),
+            "xml:\n  diff (- expected, + actual):\n    @@ -1,3 +1,3 @@\n     <out>\n    -<a/>\n    +<b/>\n     </out>\n"
+        );
+    }
+
+    #[test]
+    fn test_failure_string_value_diff_keeps_carriage_returns() {
+        // A string value is compared exactly, so a CR is a real difference.
+        let failure = Failure::StringValue(
+            AssertStringValue::new("a\r\nb\n".to_string(), false),
+            AssertStringValueFailure::WrongStringValue("a\nb\n".to_string()),
+        );
+        assert!(failure.to_string().contains("diff"));
+    }
+
+    #[test]
+    fn test_failure_diff_falls_back_to_both_sides_when_the_text_is_the_same() {
+        // Only the declaration differed, which the comparison ignores, so a diff
+        // would be empty; the reader still gets both texts.
+        let failure = xml_failure(
+            "<?xml version=\"1.0\"?><out>\n<a/>\n</out>\n",
+            "<out>\n<a/>\n</out>\n",
+        );
+        let shown = failure.to_string();
+        assert!(!shown.contains("diff"));
+        assert!(shown.contains("  expected:\n") && shown.contains("  actual:\n"));
+    }
+
+    #[test]
+    fn test_failure_string_value_display_multiline_is_a_diff() {
+        let failure = Failure::StringValue(
+            AssertStringValue::new("a\nb\n".to_string(), false),
+            AssertStringValueFailure::WrongStringValue("a\nc\n".to_string()),
         );
         assert_eq!(
             failure.to_string(),
-            "xml:\n  expected:\n    <out>\n    <a/>\n    </out>\n  actual: <out/>\n"
+            "string-value:\n  diff (- expected, + actual):\n    @@ -1,2 +1,2 @@\n     a\n    -b\n    +c\n"
         );
     }
 
