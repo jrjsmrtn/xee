@@ -420,8 +420,8 @@ impl Assertable for AssertXml {
             }
         };
 
-        let expected = match &self {
-            Self::MatchString(s) => compare_xot.parse_fragment(s).unwrap(),
+        let (expected, expected_text) = match &self {
+            Self::MatchString(s) => (compare_xot.parse_fragment(s).unwrap(), s.clone()),
             Self::MatchFile(path) => {
                 let expected_xml = std::fs::File::open(path).and_then(std::io::read_to_string);
 
@@ -435,7 +435,7 @@ impl Assertable for AssertXml {
                     }
                 };
 
-                compare_xot.parse(&expected_xml).unwrap()
+                (compare_xot.parse(&expected_xml).unwrap(), expected_xml)
             }
         };
 
@@ -445,7 +445,13 @@ impl Assertable for AssertXml {
         if c {
             TestOutcome::Passed
         } else {
-            TestOutcome::Failed(Failure::Xml(self.clone(), AssertXmlFailure::WrongXml(xml)))
+            TestOutcome::Failed(Failure::Xml(
+                self.clone(),
+                AssertXmlFailure::WrongXml {
+                    expected: expected_text,
+                    actual: xml,
+                },
+            ))
         }
     }
 }
@@ -929,7 +935,7 @@ pub enum AssertStringValueFailure {
 
 #[derive(Debug, PartialEq)]
 pub enum AssertXmlFailure {
-    WrongXml(String),
+    WrongXml { expected: String, actual: String },
     WrongValue(Sequence),
 }
 
@@ -1005,14 +1011,32 @@ impl fmt::Display for Failure {
             }
             Failure::StringValue(a, failure) => {
                 writeln!(f, "string-value:")?;
-                writeln!(f, "  expected: {:?}", a.0)?;
-                writeln!(f, "  actual: {:?}", failure)?;
+                write_text(f, "expected", &a.0)?;
+                match failure {
+                    AssertStringValueFailure::WrongStringValue(actual) => {
+                        write_text(f, "actual", actual)?;
+                    }
+                    AssertStringValueFailure::WrongValue(_) => {
+                        writeln!(f, "  actual: {:?}", failure)?;
+                    }
+                }
                 Ok(())
             }
             Failure::Xml(a, failure) => {
                 writeln!(f, "xml:")?;
-                writeln!(f, "  expected: {:?}", a)?;
-                writeln!(f, "  actual: {:?}", failure)?;
+                match failure {
+                    AssertXmlFailure::WrongXml { expected, actual } => {
+                        if let AssertXml::MatchFile(path) = a {
+                            writeln!(f, "  expected file: {}", path.display())?;
+                        }
+                        write_text(f, "expected", expected)?;
+                        write_text(f, "actual", actual)?;
+                    }
+                    AssertXmlFailure::WrongValue(_) => {
+                        writeln!(f, "  expected: {:?}", a)?;
+                        writeln!(f, "  actual: {:?}", failure)?;
+                    }
+                }
                 Ok(())
             }
             Failure::Assert(_a, failure) => {
@@ -1044,6 +1068,21 @@ impl fmt::Display for Failure {
                 Ok(())
             }
         }
+    }
+}
+
+// Write a labelled text value without Rust's debug escaping, so multi-line
+// XML stays readable. Single-line text stays on the label's line; multi-line
+// text goes in an indented block below it.
+fn write_text(f: &mut fmt::Formatter<'_>, label: &str, text: &str) -> fmt::Result {
+    if text.contains('\n') {
+        writeln!(f, "  {}:", label)?;
+        for line in text.lines() {
+            writeln!(f, "    {}", line)?;
+        }
+        Ok(())
+    } else {
+        writeln!(f, "  {}: {}", label, text)
     }
 }
 
@@ -1084,6 +1123,48 @@ mod tests {
     use super::*;
 
     use crate::{language::XPathLanguage, ns::XPATH_TEST_NS, paths::Mode};
+
+    #[test]
+    fn test_failure_xml_display_multiline() {
+        let failure = Failure::Xml(
+            AssertXml::new("<out>\n<a/>\n</out>".to_string()),
+            AssertXmlFailure::WrongXml {
+                expected: "<out>\n<a/>\n</out>".to_string(),
+                actual: "<out/>".to_string(),
+            },
+        );
+        assert_eq!(
+            failure.to_string(),
+            "xml:\n  expected:\n    <out>\n    <a/>\n    </out>\n  actual: <out/>\n"
+        );
+    }
+
+    #[test]
+    fn test_failure_xml_display_names_expected_file() {
+        let failure = Failure::Xml(
+            AssertXml::new_file(PathBuf::from("some/expected.out")),
+            AssertXmlFailure::WrongXml {
+                expected: "<a/>".to_string(),
+                actual: "<b/>".to_string(),
+            },
+        );
+        assert_eq!(
+            failure.to_string(),
+            "xml:\n  expected file: some/expected.out\n  expected: <a/>\n  actual: <b/>\n"
+        );
+    }
+
+    #[test]
+    fn test_failure_string_value_display_does_not_escape() {
+        let failure = Failure::StringValue(
+            AssertStringValue::new("say \"hi\"".to_string(), false),
+            AssertStringValueFailure::WrongStringValue("say \"bye\"".to_string()),
+        );
+        assert_eq!(
+            failure.to_string(),
+            "string-value:\n  expected: say \"hi\"\n  actual: say \"bye\"\n"
+        );
+    }
 
     #[test]
     fn test_test_case_result() {
